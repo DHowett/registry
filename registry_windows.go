@@ -60,6 +60,7 @@ type registryValue struct {
 
 	data []byte
 	kind int // syscall.REG_DWORD, etc.
+	skip bool
 }
 
 func (rv *registryValue) fieldInfo() *fieldInfo {
@@ -72,6 +73,8 @@ type registryKey struct {
 
 	field *fieldInfo
 	path  string
+
+	skip bool
 
 	subentries []registryEntry
 }
@@ -160,6 +163,7 @@ func (rk *registryKey) populate(parent syscall.Handle) error {
 			if rk.field.required {
 				return fmt.Errorf("registry: required key '%s' could not be opened.", rk.path)
 			} else {
+				rk.skip = true
 				return nil
 			}
 		}
@@ -197,7 +201,7 @@ func (rv *registryValue) populate(parent syscall.Handle) error {
 		if rv.field.required {
 			return fmt.Errorf("registry: required value '%s' could not be opened.", rv.field.name)
 		} else {
-			rv.kind = -2
+			rv.skip = true
 			return nil
 		}
 	}
@@ -212,6 +216,9 @@ func (rv *registryValue) populate(parent syscall.Handle) error {
 }
 
 func (rk *registryKey) unmarshal(val reflect.Value) error {
+	if rk.skip {
+		return nil
+	}
 	// registryKeys always get unmarshalled to structs.
 	if val.Kind() == reflect.Ptr {
 		if val.IsNil() {
@@ -240,6 +247,10 @@ const (
 )
 
 func (rv *registryValue) unmarshal(val reflect.Value) error {
+	if rv.skip {
+		return nil
+	}
+
 	var newKind int = kindUnknown
 	var x interface{}
 	switch rv.kind {
@@ -271,8 +282,6 @@ func (rv *registryValue) unmarshal(val reflect.Value) error {
 	case syscall.REG_BINARY:
 		x = rv.data
 		newKind = kindData
-	case -2: // missing key
-		return nil
 	default:
 		return fmt.Errorf("registry: tried to unmarshal registry key '%s' of type 0x%8.08x, but we don't know what do do with it", rv.field.name, rv.kind)
 	}
