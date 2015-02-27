@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"net/url"
 	"reflect"
 	"strings"
 	"syscall"
@@ -14,126 +15,215 @@ import (
 	"unicode/utf8"
 )
 
-type registryEntry struct {
-	name string
-	data []byte
-	kind int // syscall.REG_DWORD, etc.
-
-	field reflect.StructField
+type fieldInfo struct {
+	name      string
+	required  bool
+	index     []int
+	anonymous bool
 }
 
-func Parse(hive, path string, i interface{}) error {
-	rval := reflect.ValueOf(i)
-	if rval.Kind() == reflect.Ptr {
-		if rval.Type().Elem().Kind() != reflect.Struct {
-			return errors.New("registry: cannot unmarshal into non-struct")
-		} else {
-			if rval.IsNil() {
-				rval.Set(reflect.New(rval.Type().Elem()))
-			}
-			rval = rval.Elem()
+func fieldToFieldInfo(field reflect.StructField) *fieldInfo {
+	tag := field.Tag.Get("registry")
+	if tag == "-" {
+		return nil
+	}
+	sp := strings.Split(tag, ",")
+	fi := &fieldInfo{index: field.Index}
+	fi.name = sp[0]
+	if fi.name == "" {
+		fi.name = field.Name
+	}
+
+	for _, component := range sp[1:] {
+		if component == "required" {
+			fi.required = true
 		}
 	}
-	if rval.Kind() != reflect.Struct {
+	fi.anonymous = field.Anonymous
+	return fi
+}
+
+type registryEntry interface {
+	unmarshal(reflect.Value) error
+	fieldInfo() *fieldInfo
+	populate(syscall.Handle) error
+}
+
+type registryValue struct {
+	parent syscall.Handle
+
+	field *fieldInfo
+
+	data []byte
+	kind int // syscall.REG_DWORD, etc.
+}
+
+func (rv *registryValue) fieldInfo() *fieldInfo {
+	return rv.field
+}
+
+type registryKey struct {
+	parent syscall.Handle
+	hkey   syscall.Handle
+
+	field *fieldInfo
+	path  string
+
+	subentries []registryEntry
+}
+
+func (rk *registryKey) fieldInfo() *fieldInfo {
+	return rk.field
+}
+
+func Parse(u string, i interface{}) error {
+	rval := reflect.ValueOf(i)
+	if (rval.Kind() == reflect.Ptr && rval.Type().Elem().Kind() != reflect.Struct) &&
+		(rval.Kind() != reflect.Struct) {
 		return errors.New("registry: cannot unmarshal into non-struct")
 	}
 
-	structType := rval.Type()
-	entries := map[string]*registryEntry{}
-	for i := 0; i < structType.NumField(); i++ {
-		field := structType.Field(i)
-		tag := field.Tag.Get("registry")
-		if tag == "-" {
-			continue
-		}
-
-		if tag == "" {
-			tag = field.Name
-		}
-
-		entries[tag] = &registryEntry{
-			name:  tag,
-			data:  nil,
-			kind:  -1,
-			field: field,
-		}
-	}
-
-	err := readRegistry(hive, path, entries)
+	regUrl, err := url.Parse(u)
 	if err != nil {
-		panic(err)
+		return err
 	}
 
-	for _, entry := range entries {
-		err := entry.unmarshal(rval.FieldByIndex(entry.field.Index))
-		if err != nil {
-			panic(err)
-		}
-	}
-	return nil
-}
-
-func readRegistry(hive, path string, entries map[string]*registryEntry) error {
-	var rootHandle syscall.Handle
-	switch hive {
-	case "HKCU":
-		rootHandle = syscall.HKEY_CURRENT_USER
-	case "HKLM":
-		rootHandle = syscall.HKEY_LOCAL_MACHINE
+	rootHkey := syscall.Handle(0)
+	switch strings.ToLower(regUrl.Host) {
+	case "hkcu":
+		rootHkey = syscall.HKEY_CURRENT_USER
+	case "hklm":
+		rootHkey = syscall.HKEY_LOCAL_MACHINE
 	default:
-		return fmt.Errorf("registry: unknown root key '%s'", hive)
+		return fmt.Errorf("registry: unknown root key '%s'", regUrl.Host)
 	}
 
-	pathU16, err := syscall.UTF16PtrFromString(path)
+	path := strings.Replace(regUrl.Path[1:], "/", `\`, -1)
+	ent := entryFor(rval.Type(), path, &fieldInfo{required: true})
+	err = ent.populate(rootHkey)
 	if err != nil {
-		panic(err)
+		return err
 	}
 
-	var hkey syscall.Handle
-	err = syscall.RegOpenKeyEx(rootHandle, pathU16, 0, syscall.KEY_READ, &hkey)
+	err = ent.unmarshal(rval)
 	if err != nil {
-		panic(err)
+		return err
 	}
 
-	// Close the registry key when we're done.
-	defer func() {
-		err = syscall.RegCloseKey(hkey)
+	return nil
+}
+
+func entryFor(typ reflect.Type, path string, fi *fieldInfo) registryEntry {
+	if fi == nil {
+		fi = &fieldInfo{}
+	}
+	if typ.Kind() == reflect.Ptr {
+		typ = typ.Elem()
+	}
+
+	if typ.Kind() == reflect.Struct {
+		subentries := make([]registryEntry, 0, 16)
+		for i := 0; i < typ.NumField(); i++ {
+			field := typ.Field(i)
+			newFi := fieldToFieldInfo(field)
+			if newFi == nil {
+				continue
+			}
+			subentries = append(subentries, entryFor(typ.Field(i).Type, newFi.name, newFi))
+		}
+		return &registryKey{
+			field:      fi,
+			path:       path,
+			subentries: subentries,
+		}
+	} else {
+		return &registryValue{
+			field: fi,
+			kind:  -1,
+		}
+	}
+}
+
+func (rk *registryKey) populate(parent syscall.Handle) error {
+	if !rk.field.anonymous {
+		pathU16, err := syscall.UTF16PtrFromString(rk.path)
 		if err != nil {
 			panic(err)
 		}
-	}()
 
-	for _, entry := range entries {
-		data, kind, err := regQueryValue(hkey, entry.name)
+		err = syscall.RegOpenKeyEx(parent, pathU16, 0, syscall.KEY_READ, &rk.hkey)
 		if err != nil {
-			// continue, for now
-			entry.kind = -2
-			continue
+			if rk.field.required {
+				return fmt.Errorf("registry: required key '%s' could not be opened.", rk.path)
+			} else {
+				return nil
+			}
 		}
-		entry.data = data
-		entry.kind = kind
+
+		// Close the registry key when we're done.
+		defer func() {
+			err = syscall.RegCloseKey(rk.hkey)
+			if err != nil {
+				panic(err)
+			}
+		}()
+	} else {
+		rk.hkey = parent
+	}
+
+	for _, entry := range rk.subentries {
+		err := entry.populate(rk.hkey)
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
-func regQueryValue(hkey syscall.Handle, name string) ([]byte, int, error) {
-	nameU16, err := syscall.UTF16PtrFromString(name)
+func (rv *registryValue) populate(parent syscall.Handle) error {
+	nameU16, err := syscall.UTF16PtrFromString(rv.field.name)
 	if err != nil {
-		return nil, -1, err
+		return err
 	}
 	var dataLen uint32
 	var keyType uint32
 	// get length
-	err = syscall.RegQueryValueEx(hkey, nameU16, nil, &keyType, nil, &dataLen)
+	err = syscall.RegQueryValueEx(parent, nameU16, nil, &keyType, nil, &dataLen)
 	if err != nil {
-		return nil, -1, err
+		if rv.field.required {
+			return fmt.Errorf("registry: required value '%s' could not be opened.", rv.field.name)
+		} else {
+			rv.kind = -2
+			return nil
+		}
 	}
 	data := make([]byte, int(dataLen))
-	err = syscall.RegQueryValueEx(hkey, nameU16, nil, nil, &data[0], &dataLen)
+	err = syscall.RegQueryValueEx(parent, nameU16, nil, nil, &data[0], &dataLen)
 	if err != nil {
-		return nil, -1, err
+		return err
 	}
-	return data, int(keyType), nil
+	rv.data = data
+	rv.kind = int(keyType)
+	return nil
+}
+
+func (rk *registryKey) unmarshal(val reflect.Value) error {
+	// registryKeys always get unmarshalled to structs.
+	if val.Kind() == reflect.Ptr {
+		if val.IsNil() {
+			val.Set(reflect.New(val.Type().Elem()))
+		}
+		val = val.Elem()
+	}
+
+	for _, ent := range rk.subentries {
+		newVal := val.FieldByIndex(ent.fieldInfo().index)
+		err := ent.unmarshal(newVal)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 const (
@@ -145,42 +235,42 @@ const (
 	kindMultiString
 )
 
-func (entry *registryEntry) unmarshal(val reflect.Value) error {
+func (rv *registryValue) unmarshal(val reflect.Value) error {
 	var newKind int = kindUnknown
 	var x interface{}
-	switch entry.kind {
+	switch rv.kind {
 	case syscall.REG_DWORD_BIG_ENDIAN:
 		var v uint32
 		bo := binary.BigEndian
 		newKind = kindNumeric
-		binary.Read(bytes.NewReader(entry.data), bo, &v)
+		binary.Read(bytes.NewReader(rv.data), bo, &v)
 		x = v
 	case syscall.REG_DWORD_LITTLE_ENDIAN:
 		var v uint32
 		bo := binary.LittleEndian
 		newKind = kindNumeric
-		binary.Read(bytes.NewReader(entry.data), bo, &v)
+		binary.Read(bytes.NewReader(rv.data), bo, &v)
 		x = v
 	case syscall.REG_QWORD_LITTLE_ENDIAN:
 		var v uint64
 		bo := binary.LittleEndian
 		newKind = kindBigNumeric
-		binary.Read(bytes.NewReader(entry.data), bo, &v)
+		binary.Read(bytes.NewReader(rv.data), bo, &v)
 		x = v
 	case syscall.REG_SZ, syscall.REG_EXPAND_SZ:
-		x = string(utf16BytesToUTF8(entry.data[:len(entry.data)-2]))
+		x = string(utf16BytesToUTF8(rv.data[:len(rv.data)-2]))
 		newKind = kindString
 	case syscall.REG_MULTI_SZ:
-		multiSzs := strings.Split(string(utf16BytesToUTF8(entry.data)), "\000")
+		multiSzs := strings.Split(string(utf16BytesToUTF8(rv.data)), "\000")
 		x = multiSzs[:len(multiSzs)-2]
 		newKind = kindMultiString
 	case syscall.REG_BINARY:
-		x = entry.data
+		x = rv.data
 		newKind = kindData
 	case -2: // missing key
 		return nil
 	default:
-		return fmt.Errorf("registry: tried to unmarshal registry key `%s` of type 0x%8.08x, but we don't know what do do with it", entry.name, entry.kind)
+		return fmt.Errorf("registry: tried to unmarshal registry key '%s' of type 0x%8.08x, but we don't know what do do with it", rv.field.name, rv.kind)
 	}
 
 	valKind := val.Kind()
@@ -193,45 +283,45 @@ func (entry *registryEntry) unmarshal(val reflect.Value) error {
 	switch valKind {
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32:
 		if newKind != kindNumeric {
-			return fmt.Errorf("registry: tried to unmarshal non-numeric registry key '%s' into a %v", entry.name, valKind)
+			return fmt.Errorf("registry: tried to unmarshal non-numeric registry key '%s' into a %v", rv.field.name, valKind)
 		}
 		val.SetUint(uint64(x.(uint32)))
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32:
 		if newKind != kindNumeric {
-			return fmt.Errorf("registry: tried to unmarshal non-numeric registry key '%s' into a %v", entry.name, valKind)
+			return fmt.Errorf("registry: tried to unmarshal non-numeric registry key '%s' into a %v", rv.field.name, valKind)
 		}
 		val.SetInt(int64(x.(uint32)))
 	case reflect.Uint64:
 		if newKind != kindBigNumeric {
-			return fmt.Errorf("registry: tried to unmarshal non-bignum registry key '%s' into a %v", entry.name, valKind)
+			return fmt.Errorf("registry: tried to unmarshal non-bignum registry key '%s' into a %v", rv.field.name, valKind)
 		}
 		val.SetUint(x.(uint64))
 	case reflect.Int64:
 		if newKind != kindBigNumeric {
-			return fmt.Errorf("registry: tried to unmarshal non-bignum registry key '%s' into a %v", entry.name, valKind)
+			return fmt.Errorf("registry: tried to unmarshal non-bignum registry key '%s' into a %v", rv.field.name, valKind)
 		}
 		val.SetInt(int64(x.(uint64)))
 	case reflect.Slice:
 		if val.Type().Elem().Kind() == reflect.Uint8 {
 			if newKind != kindData {
-				return fmt.Errorf("registry: tried to unmarshal non-data value `%s` into a %v", entry.name, valKind)
+				return fmt.Errorf("registry: tried to unmarshal non-data value '%s' into a %v", rv.field.name, valKind)
 			}
 			val.SetBytes(x.([]byte))
 		} else if val.Type().Elem().Kind() == reflect.String {
 			if newKind != kindMultiString {
-				return fmt.Errorf("registry: tried to unmarshal non-multistring value `%s` into a %v", entry.name, valKind)
+				return fmt.Errorf("registry: tried to unmarshal non-multistring value '%s' into a %v", rv.field.name, valKind)
 			}
 			val.Set(reflect.ValueOf(x))
 		} else {
-			return fmt.Errorf("registry: tried to unmarshal data or multistring value `%s` into non-slice %v", entry.name, entry.field)
+			return fmt.Errorf("registry: tried to unmarshal data or multistring value '%s' into non-slice %v", rv.field.name, rv.field)
 		}
 	case reflect.String:
 		if newKind != kindString {
-			return fmt.Errorf("registry: tried to unmarshal non-string value `%s` into a %v", entry.name, valKind)
+			return fmt.Errorf("registry: tried to unmarshal non-string value '%s' into a %v", rv.field.name, valKind)
 		}
 		val.SetString(x.(string))
 	default:
-		return fmt.Errorf("registry: tried to unmarshal registry key `%s` of type 0x%8.08x into unknown go type %v", entry.name, entry.kind, valKind)
+		return fmt.Errorf("registry: tried to unmarshal registry key '%s' of type 0x%8.08x into unknown go type %v", rv.field.name, rv.kind, valKind)
 	}
 	return nil
 }

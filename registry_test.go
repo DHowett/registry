@@ -18,7 +18,23 @@ type BasicStruct struct {
 
 func TestUnmarshal(t *testing.T) {
 	var bs BasicStruct
-	err := Parse("HKLM", `Software\HowettNET\Test`, &bs)
+	err := Parse("//hklm/Software/HowettNET/Test", &bs)
+	if err != nil {
+		t.Log(err)
+		t.Fail()
+	}
+	t.Logf("%+v", bs)
+}
+
+type ComplexStruct struct {
+	Ess      string
+	SubBasic BasicStruct
+	BasicStruct
+}
+
+func TestNestedUnmarshal(t *testing.T) {
+	var bs ComplexStruct
+	err := Parse("//hklm/Software/HowettNET/Test", &bs)
 	if err != nil {
 		t.Log(err)
 		t.Fail()
