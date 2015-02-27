@@ -23,6 +23,10 @@ type fieldInfo struct {
 }
 
 func fieldToFieldInfo(field reflect.StructField) *fieldInfo {
+	if field.PkgPath != "" {
+		return nil // non-exported fields begone!
+	}
+
 	tag := field.Tag.Get("registry")
 	if tag == "-" {
 		return nil
