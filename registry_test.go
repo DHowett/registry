@@ -33,8 +33,9 @@ type ComplexStruct struct {
 }
 
 func TestNestedUnmarshal(t *testing.T) {
+	dec := NewDecoder("//hklm/Software/HowettNET/Test")
 	var bs ComplexStruct
-	err := Parse("//hklm/Software/HowettNET/Test", &bs)
+	err := dec.Decode(&bs)
 	if err != nil {
 		t.Log(err)
 		t.Fail()

@@ -7,7 +7,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"net/url"
 	"reflect"
 	"strings"
 	"syscall"
@@ -83,31 +82,24 @@ func (rk *registryKey) fieldInfo() *fieldInfo {
 	return rk.field
 }
 
-func Parse(u string, i interface{}) error {
+func (d *Decoder) Decode(i interface{}) error {
 	rval := reflect.ValueOf(i)
 	if (rval.Kind() == reflect.Ptr && rval.Type().Elem().Kind() != reflect.Struct) &&
 		(rval.Kind() != reflect.Struct) {
 		return errors.New("registry: cannot unmarshal into non-struct")
 	}
 
-	regUrl, err := url.Parse(u)
-	if err != nil {
-		return err
-	}
-
 	rootHkey := syscall.Handle(0)
-	switch strings.ToLower(regUrl.Host) {
+	switch d.root {
 	case "hkcu":
 		rootHkey = syscall.HKEY_CURRENT_USER
 	case "hklm":
 		rootHkey = syscall.HKEY_LOCAL_MACHINE
 	default:
-		return fmt.Errorf("registry: unknown root key '%s'", regUrl.Host)
+		return fmt.Errorf("registry: unknown root key '%s'", d.root)
 	}
-
-	path := strings.Replace(regUrl.Path[1:], "/", `\`, -1)
-	ent := entryFor(rval.Type(), path, &fieldInfo{required: true})
-	err = ent.populate(rootHkey)
+	ent := entryFor(rval.Type(), d.path, &fieldInfo{required: true})
+	err := ent.populate(rootHkey)
 	if err != nil {
 		return err
 	}
