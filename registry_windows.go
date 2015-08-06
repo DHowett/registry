@@ -15,20 +15,21 @@ import (
 )
 
 type fieldInfo struct {
-	name      string
-	required  bool
-	index     []int
-	anonymous bool
+	name       string
+	required   bool
+	index      []int
+	anonymous  bool
+	flatString bool
 }
 
-func fieldToFieldInfo(field reflect.StructField) *fieldInfo {
+func fieldToFieldInfo(field reflect.StructField) (*fieldInfo, error) {
 	if field.PkgPath != "" {
-		return nil // non-exported fields begone!
+		return nil, nil // non-exported fields begone!
 	}
 
 	tag := field.Tag.Get("registry")
 	if tag == "-" {
-		return nil
+		return nil, nil
 	}
 	sp := strings.Split(tag, ",")
 	fi := &fieldInfo{index: field.Index}
@@ -38,12 +39,19 @@ func fieldToFieldInfo(field reflect.StructField) *fieldInfo {
 	}
 
 	for _, component := range sp[1:] {
-		if component == "required" {
+		switch component {
+		case "required":
 			fi.required = true
+		case "flatten":
+			if field.Type.Kind() == reflect.Slice && field.Type.Elem().Kind() == reflect.String {
+				fi.flatString = true
+			} else {
+				return nil, fmt.Errorf("registry: cannot flatten string values into field %s of type %s", field.Name, field.Type.Name())
+			}
 		}
 	}
 	fi.anonymous = field.Anonymous
-	return fi
+	return fi, nil
 }
 
 type registryEntry interface {
@@ -98,8 +106,11 @@ func (d *Decoder) Decode(i interface{}) error {
 	default:
 		return fmt.Errorf("registry: unknown root key '%s'", d.root)
 	}
-	ent := entryFor(rval.Type(), d.path, &fieldInfo{required: true})
-	err := ent.populate(rootHkey)
+	ent, err := entryFor(rval.Type(), d.path, &fieldInfo{required: true})
+	if err != nil {
+		return err
+	}
+	err = ent.populate(rootHkey)
 	if err != nil {
 		return err
 	}
@@ -112,7 +123,7 @@ func (d *Decoder) Decode(i interface{}) error {
 	return nil
 }
 
-func entryFor(typ reflect.Type, path string, fi *fieldInfo) registryEntry {
+func entryFor(typ reflect.Type, path string, fi *fieldInfo) (registryEntry, error) {
 	if fi == nil {
 		fi = &fieldInfo{}
 	}
@@ -124,22 +135,29 @@ func entryFor(typ reflect.Type, path string, fi *fieldInfo) registryEntry {
 		subentries := make([]registryEntry, 0, 16)
 		for i := 0; i < typ.NumField(); i++ {
 			field := typ.Field(i)
-			newFi := fieldToFieldInfo(field)
+			newFi, err := fieldToFieldInfo(field)
+			if err != nil {
+				return nil, err
+			}
 			if newFi == nil {
 				continue
 			}
-			subentries = append(subentries, entryFor(typ.Field(i).Type, newFi.name, newFi))
+			newEntry, err := entryFor(typ.Field(i).Type, newFi.name, newFi)
+			if err != nil {
+				return nil, err
+			}
+			subentries = append(subentries, newEntry)
 		}
 		return &registryKey{
 			field:      fi,
 			path:       path,
 			subentries: subentries,
-		}
+		}, nil
 	} else {
 		return &registryValue{
 			field: fi,
 			kind:  -1,
-		}
+		}, nil
 	}
 }
 
@@ -198,7 +216,7 @@ func (rv *registryValue) populate(parent syscall.Handle) error {
 		}
 	}
 	data := make([]byte, int(dataLen))
-	err = syscall.RegQueryValueEx(parent, nameU16, nil, nil, &data[0], &dataLen)
+	err = syscall.RegQueryValueEx(parent, nameU16, nil, &keyType, &data[0], &dataLen)
 	if err != nil {
 		return err
 	}
@@ -313,10 +331,14 @@ func (rv *registryValue) unmarshal(val reflect.Value) error {
 			}
 			val.SetBytes(x.([]byte))
 		} else if val.Type().Elem().Kind() == reflect.String {
-			if newKind != kindMultiString {
-				return fmt.Errorf("registry: tried to unmarshal non-multistring value '%s' into a %v", rv.field.name, valKind)
+			if newKind == kindString && rv.field.flatString {
+				val.Set(reflect.ValueOf(strings.Split(x.(string), ";")))
+			} else {
+				if newKind != kindMultiString {
+					return fmt.Errorf("registry: tried to unmarshal non-multistring value '%s' into a %v", rv.field.name, valKind)
+				}
+				val.Set(reflect.ValueOf(x))
 			}
-			val.Set(reflect.ValueOf(x))
 		} else {
 			return fmt.Errorf("registry: tried to unmarshal data or multistring value '%s' into non-slice %v", rv.field.name, rv.field)
 		}

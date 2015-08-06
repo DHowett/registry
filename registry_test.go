@@ -42,3 +42,18 @@ func TestNestedUnmarshal(t *testing.T) {
 	}
 	t.Logf("%+v", bs)
 }
+
+type Environment struct {
+	PATH []string `registry:",flatten"`
+}
+
+func TestFlatStringUnmarshal(t *testing.T) {
+	dec := NewDecoder("//hklm/SYSTEM/CurrentControlSet/Control/Session Manager/Environment")
+	var env Environment
+	err := dec.Decode(&env)
+	if err != nil {
+		t.Log(err)
+		t.Fail()
+	}
+	t.Logf("%+v", env)
+}
